@@ -1,9 +1,13 @@
+<div align="center">
+
 # 🎵 Yandex Music Controller
 
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
 ![UI](https://img.shields.io/badge/UI-CustomTkinter-purple)
 ![Status](https://img.shields.io/badge/status-active-success)
+
+</div>
 
 ---
 
@@ -66,9 +70,13 @@
 
 ---
 
+<div align="center">
+  
 ## 🖼 Скриншот
 
 <img width="312" height="532" alt="2026-04-15_00-17-05" src="https://github.com/user-attachments/assets/1bfe0492-2959-4748-a0da-604d0746cb65" />
+
+</div>
 
 ---
 
