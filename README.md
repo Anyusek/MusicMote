@@ -2,7 +2,7 @@
 
 <img width="136" height="135" alt="2026-08-24_00-58-11-Photoroom" src="https://github.com/user-attachments/assets/867bd774-7cbc-4040-8ce4-74b0a4b5fafa" />
 
-🌍 [English version](README-EN)
+🌍🇬🇧[English version](README-EN)
 
 # 🎵 MusicMote (Beta)
 
