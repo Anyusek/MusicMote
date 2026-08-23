@@ -81,9 +81,9 @@
 
 ```bash
 git clone https://github.com/Anyusek/Yandex-music-controller.git
-cd Yandex-music-controller
+cd MusicMote
 pip install -r requirements.txt
-python yandex_music_controller.py
+python MusicMote.py
 ```
 
 ---
