@@ -1,0 +1,885 @@
+import os
+import json
+import logging
+import subprocess
+import time
+import threading
+from pathlib import Path
+from typing import Optional, Callable, List, Dict
+from tkinter import filedialog as fd
+from tkinter import messagebox 
+import customtkinter as ctk
+import win32api
+import win32con
+import win32gui
+
+# Логирование
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("YaMusicCtrl")
+
+try:
+    import keyboard
+    HAS_KEYBOARD = True
+except ImportError:
+    HAS_KEYBOARD = False
+    logger.warning("Библиотека 'keyboard' не установлена.")
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
+    logger.warning("Библиотека 'pystray' не установлена.")
+
+try:
+    import win32com.client
+    HAS_WIN32COM = True
+except ImportError:
+    HAS_WIN32COM = False
+    logger.warning("Библиотека 'pywin32' не установлена.")
+
+# БЕЗОПАСНАЯ БИБЛИОТЕКА ДЛЯ DRAG & DROP
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+    logger.warning("Библиотека 'tkinterdnd2' не установлена. Drag & Drop отключен.")
+
+# Конфигурация путей и констант
+WINDOW_TITLE_KEYWORD = "Яндекс Музыка"
+CONFIG_FILE = Path("config.json")
+WM_APPCOMMAND = 0x0319
+APPCOMMAND_MEDIA_PLAY_PAUSE = 14
+APPCOMMAND_MEDIA_NEXTTRACK = 11
+APPCOMMAND_MEDIA_PREVIOUSTRACK = 12
+APPCOMMAND_VOLUME_UP = 10
+APPCOMMAND_VOLUME_DOWN = 9
+APPCOMMAND_VOLUME_MUTE = 8
+LAUNCH_TIMEOUT_SEC = 15.0  
+LAUNCH_POLL_INTERVAL = 0.5 
+
+DEFAULT_HOTKEYS = {
+    "play_pause": "ctrl+p",
+    "next_track": "ctrl+right",
+    "prev_track": "ctrl+left",
+    "vol_up": "ctrl+up",
+    "vol_down": "ctrl+down",
+    "mute": "ctrl+m"
+}
+
+def create_app_icon_image(size: int = 64):
+    """Генерирует фирменную иконку MusicMote (жёлтый скругленный квадрат с глиф-эффектом 'M')."""
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        radius = int(size * 0.24)
+        draw.rounded_rectangle([1, 1, size - 2, size - 2], radius=radius, fill=(255, 186, 0, 255))
+        
+        scale = size / 100.0
+        base_coords = [
+            (24.5, 73.0),
+            (24.5, 27.0),
+            (36.0, 27.0),
+            (50.0, 52.5),
+            (64.0, 27.0),
+            (75.5, 27.0),
+            (75.5, 73.0),
+            (64.5, 73.0),
+            (64.5, 41.5),
+            (53.5, 61.5),
+            (46.5, 61.5),
+            (35.5, 41.5),
+            (35.5, 73.0),
+        ]
+        
+        # Левый слой (красно-оранжевый глитч)
+        red_poly = [((x - 3.2) * scale, y * scale) for x, y in base_coords]
+        draw.polygon(red_poly, fill=(211, 47, 47, 230))
+        
+        # Правый слой (темно-зеленый глитч)
+        green_poly = [((x + 3.2) * scale, y * scale) for x, y in base_coords]
+        draw.polygon(green_poly, fill=(27, 94, 32, 230))
+        
+        # Основной черный слой M
+        black_poly = [(x * scale, y * scale) for x, y in base_coords]
+        draw.polygon(black_poly, fill=(0, 0, 0, 255))
+        
+        return img
+    except Exception as e:
+        logger.debug("Icon creation error: %s", e)
+        return None
+
+TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "ru": {
+        "settings_title": "Настройки",
+        "hotkeys_header": "Горячие клавиши",
+        "other_header": "Прочее",
+        "play_pause": "Play / Pause",
+        "next_track": "Следующий трек",
+        "prev_track": "Предыдущий трек",
+        "vol_up": "Громкость +",
+        "vol_down": "Громкость -",
+        "mute": "Выключить звук",
+        "interface_lang": "Язык интерфейса",
+        "interface_theme": "Тема интерфейса",
+        "lang_system": "🖥️ Системный",
+        "lang_ru": "🇷🇺 Русский",
+        "lang_en": "🇬🇧 English",
+        "theme_system": "🖥️ Системная",
+        "theme_dark": "🌙 Тёмная",
+        "theme_light": "☀️ Светлая",
+        "reset": "Сбросить",
+        "save": "Сохранить",
+        "app_title": "MusicMote",
+        "open_app": "🚀  Открыть Я.Музыку",
+        "choose_path": "📂  Выбрать путь к приложению",
+        "open_settings": "⚙ Настройки",
+        "track_ctrl": "Управление треком",
+        "volume_ctrl": "Громкость",
+        "show_player": "🪟  Показать окно плеера",
+        "ready": "Готово к работе",
+        "using_prefix": "Используется: ",
+        "drag_hint": "Перетащите ярлык или .exe в это окно ⬇️",
+        "launching": "Запуск…",
+        "already_running": "Уже запущено",
+        "launched_ok": "Запущено ✓",
+        "timeout": "Таймаут запуска",
+        "invalid_path": "Неверный путь к .exe",
+        "saved_path": "Путь сохранен ✓",
+        "not_yamusic": "Ошибка: это не Я.Музыка",
+        "saved_toast": "Настройки сохранены ✓",
+        "shortcut_err": "Не удалось прочитать этот ярлык.\n\nПопробуйте выбрать сам файл .exe через кнопку 'Выбрать путь'.",
+        "wrong_app_warn": "Выбранный файл не похож на Яндекс Музыку!\n\nПожалуйста, выберите файл, в названии которого есть\n'Яндекс Музыка' или 'YandexMusic'."
+    },
+    "en": {
+        "settings_title": "Settings",
+        "hotkeys_header": "Hotkeys",
+        "other_header": "Other",
+        "play_pause": "Play / Pause",
+        "next_track": "Next Track",
+        "prev_track": "Previous Track",
+        "vol_up": "Volume +",
+        "vol_down": "Volume -",
+        "mute": "Mute",
+        "interface_lang": "Interface Language",
+        "interface_theme": "Interface Theme",
+        "lang_system": "🖥️ System default",
+        "lang_ru": "🇷🇺 Русский",
+        "lang_en": "🇬🇧 English",
+        "theme_system": "🖥️ System default",
+        "theme_dark": "🌙 Dark",
+        "theme_light": "☀️ Light",
+        "reset": "Reset",
+        "save": "Save",
+        "app_title": "MusicMote",
+        "open_app": "🚀  Launch Ya.Music",
+        "choose_path": "📂  Choose App Path",
+        "open_settings": "⚙ Settings",
+        "track_ctrl": "Track Control",
+        "volume_ctrl": "Volume",
+        "show_player": "🪟  Show Player Window",
+        "ready": "Ready",
+        "using_prefix": "Using: ",
+        "drag_hint": "Drag shortcut or .exe into this window ⬇️",
+        "launching": "Launching…",
+        "already_running": "Already running",
+        "launched_ok": "Launched ✓",
+        "timeout": "Launch timeout",
+        "invalid_path": "Invalid path to .exe",
+        "saved_path": "Path saved ✓",
+        "not_yamusic": "Error: not Ya.Music",
+        "saved_toast": "Settings saved ✓",
+        "shortcut_err": "Could not read this shortcut.\n\nPlease select the .exe directly via 'Choose App Path'.",
+        "wrong_app_warn": "Selected file does not match Yandex Music!\n\nPlease pick a file named 'Яндекс Музыка' or 'YandexMusic'."
+    }
+}
+
+THEMES = {
+    "dark": {
+        "bg": "#0D0D0D", "surface": "#161616", "surface2": "#1E1E1E",
+        "accent": "#FFCC00", "accent_hover": "#FFD740", "text": "#F5F5F5",
+        "text_muted": "#888888", "danger": "#FF4C4C", "success": "#4CAF50",
+        "btn_bg": "#2B2B2B", "btn_hover": "#383838",
+        "radius": 14, "btn_height": 42,
+    },
+    "light": {
+        "bg": "#F4F4F6", "surface": "#FFFFFF", "surface2": "#E5E5EA",
+        "accent": "#FFB800", "accent_hover": "#FFA000", "text": "#1A1A1A",
+        "text_muted": "#6E6E73", "danger": "#FF3B30", "success": "#34C759",
+        "btn_bg": "#E5E5EA", "btn_hover": "#D1D1D6",
+        "radius": 14, "btn_height": 42,
+    }
+}
+
+def get_system_language() -> str:
+    try:
+        import locale
+        loc = locale.getdefaultlocale()[0]
+        if loc and loc.lower().startswith("ru"):
+            return "ru"
+    except Exception:
+        pass
+    return "en"
+
+def get_system_theme() -> str:
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return "light" if val == 1 else "dark"
+    except Exception:
+        pass
+    return "dark"
+
+def resolve_language(lang: str) -> str:
+    if lang == "system":
+        return get_system_language()
+    return lang if lang in ("ru", "en") else "ru"
+
+def resolve_theme(theme: str) -> str:
+    if theme == "system":
+        return get_system_theme()
+    return theme if theme in ("dark", "light") else "dark"
+
+def load_config() -> dict:
+    default_config = {
+        "app_path": "",
+        "language": "ru",
+        "theme": "dark",
+        "hotkeys": DEFAULT_HOTKEYS.copy()
+    }
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                default_config.update(data)
+        except Exception as e:
+            logger.error("Error reading config: %s", e)
+    return default_config
+
+def save_config(config_data: dict):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error("Error saving config: %s", e)
+
+def validate_path(path_obj: Path) -> bool:
+    if not path_obj or not path_obj.exists() or not path_obj.is_file():
+        return False
+    name_lower = path_obj.name.lower()
+    return "яндекс музыка" in name_lower or "yandexmusic" in name_lower or "yandex music" in name_lower
+
+def resolve_shortcut(lnk_path: Path) -> Optional[Path]:
+    if not HAS_WIN32COM or lnk_path.suffix.lower() != '.lnk':
+        return None
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortCut(str(lnk_path))
+        target = Path(shortcut.Targetpath)
+        if target.exists():
+            return target
+    except Exception as e:
+        logger.error("Ошибка чтения ярлыка: %s", e)
+    return None
+
+def auto_find_app() -> Optional[Path]:
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
+    
+    search_paths = [
+        Path(local_app_data) / "Programs" / "YandexMusic" / "Яндекс Музыка.exe",
+        Path(local_app_data) / "Programs" / "YandexMusic" / "YandexMusic.exe",
+        Path(program_files) / "YandexMusic" / "Яндекс Музыка.exe",
+        Path(program_files_x86) / "YandexMusic" / "Яндекс Музыка.exe",
+    ]
+    for p in search_paths:
+        if validate_path(p):
+            return p
+    return None
+
+class YandexMusicWindow:
+    def __init__(self):
+        self._cached_hwnd: Optional[int] = None
+
+    def _is_valid_target_window(self, hwnd: int) -> bool:
+        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return False
+        if win32gui.GetWindow(hwnd, win32con.GW_OWNER) != 0:
+            return False
+        return WINDOW_TITLE_KEYWORD.lower() in win32gui.GetWindowText(hwnd).lower()
+
+    def find_hwnd(self) -> Optional[int]:
+        if self._cached_hwnd and self._is_valid_target_window(self._cached_hwnd):
+            return self._cached_hwnd
+        found_hwnds: List[int] = []
+        def _enum_cb(hwnd: int, _) -> bool:
+            if self._is_valid_target_window(hwnd):
+                found_hwnds.append(hwnd)
+            return True
+        win32gui.EnumWindows(_enum_cb, None)
+        if found_hwnds:
+            self._cached_hwnd = found_hwnds[0]
+            return self._cached_hwnd
+        self._cached_hwnd = None
+        return None
+
+    def send_command(self, command: int) -> bool:
+        hwnd = self.find_hwnd()
+        if hwnd is None:
+            return False
+        try:
+            win32api.PostMessage(hwnd, WM_APPCOMMAND, hwnd, command << 16)
+            return True
+        except Exception:
+            self._cached_hwnd = None
+            return False
+
+    def is_running(self) -> bool:
+        return self.find_hwnd() is not None
+
+    def bring_to_front(self) -> bool:
+        hwnd = self.find_hwnd()
+        if not hwnd: 
+            return False
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
+
+class MusicService:
+    def __init__(self, config: dict):
+        self._window = YandexMusicWindow()
+        saved_path = config.get("app_path", "")
+        self.app_path = Path(saved_path) if saved_path and validate_path(Path(saved_path)) else auto_find_app()
+
+    def launch(self, callback: Optional[Callable[[bool, str], None]] = None) -> None:
+        def _worker():
+            try:
+                if self._window.is_running():
+                    self.bring_to_front()
+                    if callback: callback(True, "already_running")
+                    return
+                if not self.app_path or not validate_path(self.app_path):
+                    if callback: callback(False, "invalid_path")
+                    return
+                subprocess.Popen(str(self.app_path))
+                start_time = time.time()
+                while time.time() - start_time < LAUNCH_TIMEOUT_SEC:
+                    if self._window.is_running():
+                        if callback: callback(True, "launched_ok")
+                        return
+                    time.sleep(LAUNCH_POLL_INTERVAL)
+                if callback: callback(False, "timeout")
+            except Exception as exc:
+                if callback: callback(False, str(exc))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def bring_to_front(self) -> bool: return self._window.bring_to_front()
+    def play_pause(self) -> bool: return self._window.send_command(APPCOMMAND_MEDIA_PLAY_PAUSE)
+    def next_track(self) -> bool: return self._window.send_command(APPCOMMAND_MEDIA_NEXTTRACK)
+    def prev_track(self) -> bool: return self._window.send_command(APPCOMMAND_MEDIA_PREVIOUSTRACK)
+    def volume_up(self) -> bool: return self._window.send_command(APPCOMMAND_VOLUME_UP)
+    def volume_down(self) -> bool: return self._window.send_command(APPCOMMAND_VOLUME_DOWN)
+    def volume_mute(self) -> bool: return self._window.send_command(APPCOMMAND_VOLUME_MUTE)
+
+class HotkeysSettingsWindow(ctk.CTkToplevel):
+    def __init__(self, parent, config: dict, on_save_cb: Callable[[dict], None]):
+        super().__init__(parent)
+        self.parent = parent
+        self.config = config
+        self.on_save_cb = on_save_cb
+        
+        # Local pending state (applied only on save)
+        self.pending_hotkeys = dict(config.get("hotkeys", DEFAULT_HOTKEYS))
+        self.pending_lang = config.get("language", "system")
+        self.pending_theme = config.get("theme", "system")
+        
+        effective_lang = resolve_language(self.pending_lang)
+        effective_theme = resolve_theme(self.pending_theme)
+        
+        self.t = TRANSLATIONS[effective_lang]
+        self.theme = THEMES[effective_theme]
+        
+        self._setup_window()
+        self._build_ui()
+
+    def _setup_window(self):
+        self.title(self.t["settings_title"])
+        self.geometry("380x600")
+        self.resizable(False, False)
+        self.configure(fg_color=self.theme["bg"])
+        self.attributes("-topmost", True)
+        try:
+            ico_path = Path(__file__).parent / "musicmote_icon.ico"
+            if ico_path.exists():
+                self.iconbitmap(str(ico_path))
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+            
+        effective_lang = resolve_language(self.pending_lang)
+        effective_theme = resolve_theme(self.pending_theme)
+        self.t = TRANSLATIONS[effective_lang]
+        self.theme = THEMES[effective_theme]
+        
+        t = self.t
+        theme = self.theme
+
+        # Header
+        ctk.CTkLabel(
+            self, text=t["hotkeys_header"], 
+            font=("Segoe UI", 18, "bold"), 
+            text_color=theme["text"]
+        ).pack(pady=(22, 14))
+
+        # Hotkeys List
+        items = [
+            ("play_pause", t["play_pause"]),
+            ("next_track", t["next_track"]),
+            ("prev_track", t["prev_track"]),
+            ("vol_up", t["vol_up"]),
+            ("vol_down", t["vol_down"]),
+            ("mute", t["mute"]),
+        ]
+
+        self.key_buttons = {}
+        for key_id, label_text in items:
+            row = ctk.CTkFrame(self, fg_color="transparent")
+            row.pack(fill="x", padx=26, pady=4)
+
+            lbl = ctk.CTkLabel(row, text=label_text, font=("Segoe UI", 13), text_color=theme["text"], anchor="w")
+            lbl.pack(side="left")
+
+            val = self.pending_hotkeys.get(key_id, DEFAULT_HOTKEYS.get(key_id, ""))
+            btn = ctk.CTkButton(
+                row, text=val, width=120, height=32,
+                corner_radius=8, font=("Segoe UI", 12),
+                fg_color=theme["btn_bg"], hover_color=theme["btn_hover"],
+                text_color=theme["text"],
+                command=lambda k=key_id: self._record_hotkey(k)
+            )
+            btn.pack(side="right")
+            self.key_buttons[key_id] = btn
+
+        # Section: "Прочее" / "Other"
+        ctk.CTkLabel(
+            self, text=t["other_header"],
+            font=("Segoe UI", 16, "bold"),
+            text_color=theme["text"]
+        ).pack(pady=(16, 8))
+
+        # 🌐 Язык интерфейса
+        lang_frame = ctk.CTkFrame(self, fg_color="transparent")
+        lang_frame.pack(fill="x", padx=26, pady=6)
+        
+        ctk.CTkLabel(
+            lang_frame, text=f"🌐 {t['interface_lang']}",
+            font=("Segoe UI", 13), text_color=theme["text"], anchor="w"
+        ).pack(side="left")
+
+        lang_values = [t["lang_system"], t["lang_ru"], t["lang_en"]]
+        if self.pending_lang == "system":
+            initial_lang_text = t["lang_system"]
+        elif self.pending_lang == "ru":
+            initial_lang_text = t["lang_ru"]
+        else:
+            initial_lang_text = t["lang_en"]
+
+        self.lang_dropdown = ctk.CTkOptionMenu(
+            lang_frame, values=lang_values,
+            width=140, height=32, corner_radius=8,
+            font=("Segoe UI", 12),
+            fg_color=theme["btn_bg"], button_color=theme["btn_hover"],
+            button_hover_color="#444444", text_color=theme["text"],
+            command=self._on_lang_select
+        )
+        self.lang_dropdown.set(initial_lang_text)
+        self.lang_dropdown.pack(side="right")
+
+        # 🎨 Тема интерфейса
+        theme_frame = ctk.CTkFrame(self, fg_color="transparent")
+        theme_frame.pack(fill="x", padx=26, pady=6)
+
+        ctk.CTkLabel(
+            theme_frame, text=f"🎨 {t['interface_theme']}",
+            font=("Segoe UI", 13), text_color=theme["text"], anchor="w"
+        ).pack(side="left")
+
+        theme_values = [t["theme_system"], t["theme_dark"], t["theme_light"]]
+        if self.pending_theme == "system":
+            initial_theme_text = t["theme_system"]
+        elif self.pending_theme == "dark":
+            initial_theme_text = t["theme_dark"]
+        else:
+            initial_theme_text = t["theme_light"]
+
+        self.theme_dropdown = ctk.CTkOptionMenu(
+            theme_frame, values=theme_values,
+            width=140, height=32, corner_radius=8,
+            font=("Segoe UI", 12),
+            fg_color=theme["btn_bg"], button_color=theme["btn_hover"],
+            button_hover_color="#444444", text_color=theme["text"],
+            command=self._on_theme_select
+        )
+        self.theme_dropdown.set(initial_theme_text)
+        self.theme_dropdown.pack(side="right")
+
+        # Bottom Buttons [ Сбросить ] [ Сохранить ]
+        btn_box = ctk.CTkFrame(self, fg_color="transparent")
+        btn_box.pack(side="bottom", fill="x", padx=26, pady=(16, 24))
+
+        ctk.CTkButton(
+            btn_box, text=t["reset"], width=150, height=42,
+            corner_radius=12, font=("Segoe UI Semibold", 13),
+            fg_color=theme["btn_bg"], hover_color=theme["btn_hover"],
+            text_color=theme["text"], command=self._on_reset
+        ).pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        ctk.CTkButton(
+            btn_box, text=t["save"], width=150, height=42,
+            corner_radius=12, font=("Segoe UI Semibold", 13),
+            fg_color=theme["btn_bg"], hover_color=theme["btn_hover"],
+            text_color=theme["text"], command=self._on_save
+        ).pack(side="right", padx=(6, 0), expand=True, fill="x")
+
+    def _on_lang_select(self, choice: str):
+        if "Систем" in choice or "System" in choice:
+            self.pending_lang = "system"
+        elif "Русский" in choice or "Russian" in choice:
+            self.pending_lang = "ru"
+        else:
+            self.pending_lang = "en"
+
+    def _on_theme_select(self, choice: str):
+        if "Систем" in choice or "System" in choice:
+            self.pending_theme = "system"
+        elif "Тёмная" in choice or "Dark" in choice:
+            self.pending_theme = "dark"
+        else:
+            self.pending_theme = "light"
+
+    def _record_hotkey(self, key_id: str):
+        btn = self.key_buttons[key_id]
+        btn.configure(text="...", fg_color=self.theme["accent"], text_color="#000000")
+        
+        def _on_key():
+            try:
+                combo = keyboard.read_hotkey(suppress=False)
+                if combo:
+                    self.pending_hotkeys[key_id] = combo
+            except Exception as exc:
+                logger.error("Error reading hotkey: %s", exc)
+            finally:
+                self.after(0, lambda: self._build_ui())
+        
+        if HAS_KEYBOARD:
+            threading.Thread(target=_on_key, daemon=True).start()
+        else:
+            val = fd.simpledialog.askstring("Hotkey", "Введите комбинацию клавиш (напр. ctrl+p):")
+            if val:
+                self.pending_hotkeys[key_id] = val
+            self._build_ui()
+
+    def _on_reset(self):
+        self.pending_hotkeys = DEFAULT_HOTKEYS.copy()
+        self.pending_lang = "system"
+        self.pending_theme = "system"
+        self._build_ui()
+
+    def _on_save(self):
+        new_config = {
+            "hotkeys": self.pending_hotkeys,
+            "language": self.pending_lang,
+            "theme": self.pending_theme
+        }
+        self.on_save_cb(new_config)
+        self.destroy()
+
+# Dynamic DND Base Class
+if HAS_DND:
+    class BaseApp(ctk.CTk, TkinterDnD.DnDWrapper): pass
+else:
+    class BaseApp(ctk.CTk): pass
+
+class App(BaseApp):
+    def __init__(self):
+        super().__init__()
+        self.config = load_config()
+        self.lang = self.config.get("language", "system")
+        self.theme_mode = self.config.get("theme", "system")
+        
+        effective_lang = resolve_language(self.lang)
+        effective_theme = resolve_theme(self.theme_mode)
+        
+        ctk.set_appearance_mode(effective_theme)
+        ctk.set_default_color_theme("dark-blue")
+        
+        self.t = TRANSLATIONS[effective_lang]
+        self.theme = THEMES[effective_theme]
+        
+        if HAS_DND:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind('<<Drop>>', self._on_drop_files)
+            except Exception as e:
+                logger.error("DND setup error: %s", e)
+
+        self._service = MusicService(self.config)
+        self._setup_window()
+        self._build_ui()
+        self._setup_hotkeys()
+        self._setup_tray()
+
+    def _setup_window(self):
+        self.title(self.t["app_title"])
+        self.geometry("320x550")
+        self.resizable(False, False)
+        self.configure(fg_color=self.theme["bg"])
+        
+        # Установка иконки окна
+        try:
+            icon_img = create_app_icon_image(64)
+            if icon_img:
+                ico_path = Path(__file__).parent / "musicmote_icon.ico"
+                if not ico_path.exists():
+                    icon_img.save(str(ico_path), format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+                self.iconbitmap(str(ico_path))
+                from PIL import ImageTk
+                self._tk_icon = ImageTk.PhotoImage(icon_img)
+                self.iconphoto(False, self._tk_icon)
+        except Exception as e:
+            logger.debug("Window icon setup error: %s", e)
+
+    def _build_ui(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        t = self.t
+        theme = self.theme
+
+        # Header
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(18, 4))
+        
+        # Logo badge & typography
+        icon_img = create_app_icon_image(40)
+        if icon_img:
+            self._ctk_logo = ctk.CTkImage(light_image=icon_img, dark_image=icon_img, size=(38, 38))
+            ctk.CTkLabel(header, image=self._ctk_logo, text="").pack(side="left")
+        else:
+            logo_box = ctk.CTkFrame(header, width=38, height=38, corner_radius=10, fg_color=theme["accent"])
+            logo_box.pack_propagate(False)
+            logo_box.pack(side="left")
+            ctk.CTkLabel(logo_box, text="M", font=("Segoe UI", 20, "bold"), text_color="#000000").pack(expand=True)
+        
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(title_box, text="MusicMote", font=("Segoe UI", 20, "bold"), text_color=theme["text"]).pack(anchor="w")
+
+        ctk.CTkFrame(self, height=1, fg_color=theme["surface2"]).pack(fill="x", padx=20, pady=(8, 14))
+
+        # Main Action Buttons
+        self._make_btn(text=t["open_app"], command=self._on_launch, accent=True).pack(pady=(0, 8))
+        self._make_btn(text=t["choose_path"], command=self._on_choose_path).pack(pady=(0, 8))
+        self._make_btn(text=t["open_settings"], command=self._on_open_settings).pack(pady=(0, 12))
+
+        self._path_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 10), text_color=theme["text_muted"])
+        self._path_label.pack(pady=(0, 10))
+        self._update_path_display()
+
+        # Track Controls
+        self._section_label(t["track_ctrl"])
+        transport = ctk.CTkFrame(self, fg_color="transparent")
+        transport.pack(pady=(4, 12))
+        self._make_small_btn(transport, "⏮", self._on_prev).pack(side="left", padx=4)
+        self._make_small_btn(transport, "⏯", self._on_play_pause, width=96).pack(side="left", padx=4)
+        self._make_small_btn(transport, "⏭", self._on_next).pack(side="left", padx=4)
+
+        # Volume Controls
+        self._section_label(t["volume_ctrl"])
+        volume = ctk.CTkFrame(self, fg_color="transparent")
+        volume.pack(pady=(4, 12))
+        self._make_small_btn(volume, "🔉", self._on_vol_down).pack(side="left", padx=4)
+        self._make_small_btn(volume, "🔇", self._on_mute, width=54).pack(side="left", padx=4)
+        self._make_small_btn(volume, "🔊", self._on_vol_up).pack(side="left", padx=4)
+
+        ctk.CTkFrame(self, height=1, fg_color=theme["surface2"]).pack(fill="x", padx=20, pady=(4, 10))
+        self._make_btn(text=t["show_player"], command=self._on_bring_to_front).pack()
+
+        # Status Bar
+        self._status_frame = ctk.CTkFrame(self, fg_color=theme["surface2"], corner_radius=8)
+        self._status_frame.pack(fill="x", padx=20, pady=(12, 14))
+        self._dot = ctk.CTkLabel(self._status_frame, text="●", font=("Segoe UI", 11), width=18, text_color=theme["text_muted"])
+        self._dot.pack(side="left", padx=(10, 2), pady=6)
+        self._status_label = ctk.CTkLabel(self._status_frame, text=t["ready"], font=("Segoe UI", 11), text_color=theme["text_muted"])
+        self._status_label.pack(side="left", padx=(0, 10), pady=6)
+
+    def _make_btn(self, text: str, command: Callable, accent: bool = False, width: int = 260) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            self, text=text, command=command, width=width, height=self.theme["btn_height"],
+            corner_radius=self.theme["radius"], font=("Segoe UI Semibold", 13),
+            fg_color=self.theme["accent"] if accent else self.theme["surface2"],
+            hover_color=self.theme["accent_hover"] if accent else "#2A2A2A",
+            text_color="#0D0D0D" if accent else self.theme["text"], border_width=0
+        )
+
+    def _make_small_btn(self, master, text: str, command: Callable, width: int = 78) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            master, text=text, command=command, width=width, height=self.theme["btn_height"],
+            corner_radius=self.theme["radius"], font=("Segoe UI Semibold", 15),
+            fg_color=self.theme["surface2"], hover_color="#2A2A2A",
+            text_color=self.theme["text"], border_width=0
+        )
+
+    def _section_label(self, text: str):
+        ctk.CTkLabel(self, text=text.upper(), font=("Segoe UI", 9), text_color=self.theme["text_muted"]).pack()
+
+    def _update_path_display(self):
+        path = self._service.app_path
+        if path and path.exists():
+            path_str = str(path)
+            if len(path_str) > 36: path_str = path_str[:14] + "..." + path_str[-18:]
+            self._path_label.configure(text=f"{self.t['using_prefix']}{path_str}")
+        else:
+            self._path_label.configure(text=self.t["drag_hint"])
+
+    def _on_open_settings(self):
+        HotkeysSettingsWindow(self, self.config, self._on_settings_saved)
+
+    def _on_settings_saved(self, new_config: dict):
+        self.config.update(new_config)
+        save_config(self.config)
+        
+        self.lang = self.config.get("language", "system")
+        self.theme_mode = self.config.get("theme", "system")
+        
+        effective_lang = resolve_language(self.lang)
+        effective_theme = resolve_theme(self.theme_mode)
+        
+        self.t = TRANSLATIONS[effective_lang]
+        self.theme = THEMES[effective_theme]
+        
+        ctk.set_appearance_mode(effective_theme)
+        self.configure(fg_color=self.theme["bg"])
+        self.title(self.t["app_title"])
+        
+        self._build_ui()
+        self._setup_hotkeys()
+        self._update_status_ui(self.t["saved_toast"], "ok")
+
+    def _setup_hotkeys(self):
+        if not HAS_KEYBOARD: return
+        try:
+            keyboard.unhook_all()
+            hk = self.config.get("hotkeys", DEFAULT_HOTKEYS)
+            if hk.get("play_pause"): keyboard.add_hotkey(hk["play_pause"], self._on_play_pause)
+            if hk.get("next_track"): keyboard.add_hotkey(hk["next_track"], self._on_next)
+            if hk.get("prev_track"): keyboard.add_hotkey(hk["prev_track"], self._on_prev)
+            if hk.get("vol_up"): keyboard.add_hotkey(hk["vol_up"], self._on_vol_up)
+            if hk.get("vol_down"): keyboard.add_hotkey(hk["vol_down"], self._on_vol_down)
+            if hk.get("mute"): keyboard.add_hotkey(hk["mute"], self._on_mute)
+        except Exception as e:
+            logger.error("Hotkeys hook error: %s", e)
+
+    def _setup_tray(self):
+        if not HAS_TRAY: return
+        self.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
+
+    def _hide_to_tray(self):
+        self.withdraw()
+        image = Image.new('RGB', (64, 64), color=(13, 13, 13))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((16, 16, 48, 48), fill=(255, 204, 0))
+        menu = pystray.Menu(
+            pystray.MenuItem("Развернуть / Restore", self._restore_from_tray),
+            pystray.MenuItem("Выход / Exit", self._quit_app)
+        )
+        self.tray_icon = pystray.Icon("YaMusicCtrl", image, "YaMusic Controller", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _restore_from_tray(self, icon, item):
+        icon.stop()
+        self.after(0, self.deiconify)
+
+    def _quit_app(self, icon, item):
+        icon.stop()
+        self.after(0, self.destroy)
+
+    def _update_status_ui(self, message: str, kind: str):
+        colors = {"info": self.theme["text_muted"], "ok": self.theme["success"], "error": self.theme["danger"]}
+        self._dot.configure(text_color=colors.get(kind, self.theme["text_muted"]))
+        self._status_label.configure(text=message, text_color=colors.get(kind, self.theme["text_muted"]))
+
+    def _on_drop_files(self, event):
+        files = self.tk.splitlist(event.data)
+        if files: self._handle_new_path(Path(files[0]))
+
+    def _handle_new_path(self, path_obj: Path):
+        if path_obj.suffix.lower() == '.lnk':
+            resolved = resolve_shortcut(path_obj)
+            if resolved: path_obj = resolved
+            else:
+                self._update_status_ui(self.t["shortcut_err"][:25], "error")
+                messagebox.showerror("Error", self.t["shortcut_err"])
+                return
+        if validate_path(path_obj):
+            self.config["app_path"] = str(path_obj)
+            save_config(self.config)
+            self._service.app_path = path_obj
+            self._update_path_display()
+            self._update_status_ui(self.t["saved_path"], "ok")
+        else:
+            self._update_status_ui(self.t["not_yamusic"], "error")
+            messagebox.showwarning("Warning", self.t["wrong_app_warn"])
+
+    def _on_launch(self):
+        self._update_status_ui(self.t["launching"], "info")
+        def _cb(success: bool, msg_key: str):
+            text = self.t.get(msg_key, msg_key)
+            self._update_status_ui(text, "ok" if success else "error")
+        self._service.launch(callback=_cb)
+
+    def _on_choose_path(self):
+        filepath = fd.askopenfilename(
+            title=self.t["choose_path"],
+            filetypes=[("Executables", "*.exe"), ("Shortcuts", "*.lnk"), ("All files", "*.*")]
+        )
+        if filepath: self._handle_new_path(Path(filepath))
+
+    def _cmd(self, action: Callable[[], bool], label: str):
+        if action(): self._update_status_ui(f"{label} ✓", "ok")
+        else: self._update_status_ui("Яндекс Музыка не найдена", "error")
+
+    def _on_play_pause(self): self._cmd(self._service.play_pause, "Play / Pause")
+    def _on_next(self): self._cmd(self._service.next_track, self.t["next_track"])
+    def _on_prev(self): self._cmd(self._service.prev_track, self.t["prev_track"])
+    def _on_vol_up(self): self._cmd(self._service.volume_up, self.t["vol_up"])
+    def _on_vol_down(self): self._cmd(self._service.volume_down, self.t["vol_down"])
+    def _on_mute(self): self._cmd(self._service.volume_mute, self.t["mute"])
+    def _on_bring_to_front(self):
+        if self._service.bring_to_front(): self._update_status_ui("Окно открыто", "ok")
+        else: self._update_status_ui("Яндекс Музыка не найдена", "error")
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
