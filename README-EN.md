@@ -141,7 +141,7 @@ MAX: https://max.ru/u/f9LHodD0cOJWoqJyV49iP9Xd-AhGVIP2DDCrlU77-ERzrRKGaMeFtnXXbv
 
 ### 👨‍💻 Author
 
-Developed with ❤️ by Anyusek
+Developed with ❤️ by **Anyusek**
 
 <details>
 <summary>📄 <strong>License</strong></summary>
